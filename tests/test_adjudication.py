@@ -397,7 +397,7 @@ def test_evaluate_unknown_challenge_reverts(direct_vm, direct_deploy, direct_bob
             c.evaluate_prior_art(bad)
 
 
-def test_sibling_challenge_is_mooted_once_patent_falls(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+def test_followers_are_voided_and_refunded_the_moment_the_patent_falls(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
     c = direct_deploy(CONTRACT)
     pid = setup_case(c, direct_vm, direct_alice, bounty=GEN)
     u1, u2 = "https://arxiv.org/abs/1801.00021", "https://arxiv.org/abs/1801.00022"
@@ -408,14 +408,17 @@ def test_sibling_challenge_is_mooted_once_patent_falls(direct_vm, direct_deploy,
     assert c.get_patent(pid)["pending_challenges"] == 2
     direct_vm.sender = direct_bob
     assert c.evaluate_prior_art(first) == "INVALIDATED"
-    direct_vm.sender = direct_charlie
-    assert c.evaluate_prior_art(second) == "AMBIGUOUS_VOID"
+    # no second evaluation needed: the follower was voided and refunded in the same transaction
     assert c.get_challenge(second)["status"] == "VOIDED"
-    assert credit(c, direct_bob) == BOND + GEN  # first-to-settle takes the pool
-    assert credit(c, direct_charlie) == BOND      # latecomer refunded, not slashed
+    assert c.get_verdict(second)["outcome"] == "AMBIGUOUS_VOID"
+    assert credit(c, direct_bob) == BOND + GEN  # head of the queue takes the pool
+    assert credit(c, direct_charlie) == BOND      # follower refunded in full, not slashed
     assert credit(c, direct_alice) == 0
     assert c.get_patent(pid)["pending_challenges"] == 0
     assert assert_solvent(c)["locked_bonds"] == "0"
+    direct_vm.sender = direct_charlie
+    with direct_vm.expect_revert("ERR_INVALID_STATE"):
+        c.evaluate_prior_art(second)
 
 
 def test_voided_source_can_be_cited_again_but_rejected_cannot(direct_vm, direct_deploy, direct_alice, direct_bob):
@@ -427,6 +430,8 @@ def test_voided_source_can_be_cited_again_but_rejected_cannot(direct_vm, direct_
     direct_vm.sender = direct_bob
     assert c.evaluate_prior_art(cid) == "AMBIGUOUS_VOID"
     assert submit(c, direct_vm, direct_bob, pid, url=dead) == 2  # voided -> citable again
+    direct_vm.sender = direct_bob
+    assert c.evaluate_prior_art(2) == "AMBIGUOUS_VOID"  # FIFO: clear it before the next one
     # a source the tribunal has rejected is res judicata for that patent
     cid3, out = run_challenge(c, direct_vm, direct_bob, pid, "https://arxiv.org/abs/1801.00031", "2022-01-01")
     assert out == "VALID"

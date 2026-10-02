@@ -246,19 +246,22 @@ def test_expire_twice_reverts(direct_vm, direct_deploy, direct_alice):
 
 
 # --------------------------------------------------------------- submission
-def test_submit_requires_exact_bond(direct_vm, direct_deploy, direct_alice, direct_bob):
+def test_submit_requires_at_least_the_minimum_bond(direct_vm, direct_deploy, direct_alice, direct_bob):
     c = direct_deploy(CONTRACT)
     pid = register(c, direct_vm, direct_alice, bounty=GEN)
     fund(direct_vm, direct_bob)
     direct_vm.sender = direct_bob
-    for v in (0, 1, BOND - 1, BOND + 1, 2 * BOND, GEN):
+    for v in (0, 1, BOND - 1):
         direct_vm.value = v
-        with direct_vm.expect_revert("ERR_BOND_MUST_BE_EXACTLY_0.1_GEN"):
+        with direct_vm.expect_revert("ERR_BOND_BELOW_MINIMUM"):
             c.submit_prior_art(pid, ARXIV, "2018-01-02")
     assert c.get_challenge_count() == 0
     assert assert_solvent(c)["locked_bonds"] == "0"
     direct_vm.value = BOND
     assert c.submit_prior_art(pid, ARXIV, "2018-01-02") == 1
+    direct_vm.value = BOND + 7  # overpaying is allowed; the whole amount is locked
+    assert c.submit_prior_art(pid, "https://arxiv.org/abs/1801.00002", "2018-01-02") == 2
+    assert c.get_challenge(2)["challenger_bond"] == str(BOND + 7)
 
 
 def test_submit_records_challenge(direct_vm, direct_deploy, direct_alice, direct_bob):
@@ -316,7 +319,8 @@ def test_duplicate_citation_rules(direct_vm, direct_deploy, direct_alice, direct
     p2 = register(c, direct_vm, direct_alice)
     submit(c, direct_vm, direct_bob, p1, url=ARXIV)
     # same source, same patent, any spelling, any challenger: refused while live
-    for variant in (ARXIV, "HTTPS://ARXIV.ORG/abs/1801.00001", ARXIV + "#frag", "https://arxiv.org:443/abs/1801.00001"):
+    for variant in (ARXIV, "HTTPS://ARXIV.ORG/abs/1801.00001", ARXIV + "#frag", "https://arxiv.org:443/abs/1801.00001",
+                    ARXIV + "v1", ARXIV + "v2/", ARXIV + "?context=cs", "https://arxiv.org/pdf/1801.00001v3.pdf"):
         for who in (direct_bob, direct_charlie):
             fund(direct_vm, who)
             direct_vm.sender = who

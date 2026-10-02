@@ -24,6 +24,13 @@
 # only extracts the source's publication date, and the contract compares it with
 # the stored priority date as plain calendar dates.
 #
+# Hardening (v2): the citation whitelist holds only authoritative, immutable hosts; the bond
+# scales with the bounty at risk (max(0.1 GEN, 2% of the pool)); URLs are canonicalised
+# (query, fragment, trailing slash, arXiv version) before the duplicate check and before
+# fetching; a patent's challenges are adjudicated strictly first-in-first-out and the
+# pending followers of an invalidating challenge are voided and refunded at once; and the
+# governor can rescue balance that no liability accounts for (rescue_excess).
+#
 # Every payout is a credit; value leaves only through pull_withdraw (pull
 # pattern). The ledger identity
 #
@@ -47,8 +54,11 @@ allow_storage = gl.storage.allow
 
 # --- Economic constants (wei; 1 GEN = 10**18) --------------------------------
 GEN = 10**18
-CHALLENGER_BOND = GEN // 10  # exactly 0.1 GEN
-MIN_BOUNTY_CONTRIBUTION = GEN // 1000  # 0.001 GEN; keeps the funder list unspammable
+CHALLENGER_BOND = GEN // 10  # base bond: 0.1 GEN
+MIN_BOUNTY_CONTRIBUTION = GEN // 20  # 0.05 GEN; dust cannot exhaust the funder slots
+BOND_BPS_OF_BOUNTY = 200  # bond floor scales with the bounty: 2% (200 bps)
+MAX_PENDING_PER_PATENT = 16  # bounds the FIFO queue scans and the follower-void loop
+RESCUE_GRACE_SECONDS = 24 * 3600  # payouts emitted this recently may still be in flight
 MAX_FUNDERS_PER_PATENT = 32  # bounds the expiry refund loop
 STALE_AFTER_SECONDS = 7 * 24 * 3600
 MIN_CONFIDENCE = 60  # below this the tribunal's finding is treated as ambiguous
@@ -81,7 +91,7 @@ V_VOID = "AMBIGUOUS_VOID"
 # --- Error classification ----------------------------------------------------
 ERR_STATE = "ERR_INVALID_STATE"
 ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
-ERR_BOND = "ERR_BOND_MUST_BE_EXACTLY_0.1_GEN"
+ERR_BOND = "ERR_BOND_BELOW_MINIMUM"
 ERR_VALUE = "ERR_INVALID_VALUE"
 ERR_INPUT = "ERR_INVALID_INPUT"
 ERR_URL = "ERR_UNSAFE_URL"
@@ -94,9 +104,16 @@ ERR_SELF = "ERR_INVENTOR_CANNOT_CHALLENGE_OWN_PATENT"
 ERR_FUNDERS = "ERR_FUNDER_LIMIT"
 ERR_TRANSFER = "ERR_TRANSFER_FAILED_RESTORED"
 ERR_INVARIANT = "ERR_SOLVENCY_INVARIANT_BROKEN"
+ERR_FIFO = "ERR_FIFO_ORDER"
+ERR_QUEUE_FULL = "ERR_CHALLENGE_QUEUE_FULL"
+ERR_NO_EXCESS = "ERR_NO_EXCESS_BALANCE"
+ERR_IN_FLIGHT = "ERR_PAYOUTS_IN_FLIGHT"
 ERR_LLM = "[LLM_ERROR]"
 
 # --- URL policy --------------------------------------------------------------
+# Domains a challenger may cite: authoritative, immutable publishers and registries only.
+# Hosts where anyone can publish or replace content (web archives, preprint aggregators,
+# review sites) are deliberately absent: a challenger could plant the "prior art" itself.
 # Domains a challenger may cite. A host is accepted when it equals one of these
 # or is a subdomain of one (labels are compared whole, never as substrings).
 ALLOWED_DOMAINS = (
@@ -110,14 +127,10 @@ ALLOWED_DOMAINS = (
     "datatracker.ietf.org",
     "rfc-editor.org",
     "w3.org",
-    "web.archive.org",
     "nature.com",
     "sciencedirect.com",
     "springer.com",
     "biorxiv.org",
-    "hal.science",
-    "semanticscholar.org",
-    "openreview.net",
     "eprint.iacr.org",
 )
 
@@ -186,6 +199,55 @@ def _normalize_url(url: str) -> str:
     if frag != -1:
         tail = tail[:frag]
     return "https://" + host + tail
+
+
+_PCT_RE = re.compile(r"%([0-9a-fA-F]{2})")
+_ARXIV_PATH_RE = re.compile(
+    r"^/(?:abs|pdf|html)/((?:\d{4}\.\d{4,5})|(?:[a-z\-]+(?:\.[A-Za-z]{2})?/\d{7}))(?:v[0-9]+)?(?:\.pdf)?$"
+)
+
+
+def _decode_unreserved(path: str) -> str:
+    """%41 and A are the same resource: decode escapes of unreserved characters and
+    upper-case the hex of every other escape, so spelling cannot mint a second hash."""
+
+    def sub(m) -> str:
+        ch = chr(int(m.group(1), 16))
+        if (ord(ch) < 128 and ch.isalnum()) or ch in "-._~":
+            return ch
+        return "%" + m.group(1).upper()
+
+    return _PCT_RE.sub(sub, path)
+
+
+def _canonicalize_url(url: str) -> str:
+    """One canonical spelling per source: validated and whitelisted (see _normalize_url),
+    then lower-case host, no query, no fragment, no trailing slash, no duplicate or dot
+    segments, and for arXiv the version suffix, /pdf/ and /html/ spellings and the
+    www/export mirrors folded into https://arxiv.org/abs/<id>. This is the string that is
+    stored, hashed for duplicate detection, and fetched."""
+    norm = _normalize_url(url)
+    rest = norm[8:]
+    cut = len(rest)
+    for sep in ("/", "?"):
+        i = rest.find(sep)
+        if i != -1 and i < cut:
+            cut = i
+    host = rest[:cut]
+    tail = rest[cut:]
+    q = tail.find("?")
+    if q != -1:
+        tail = tail[:q]
+    path = re.sub(r"/{2,}", "/", _decode_unreserved(tail)).rstrip("/")
+    for seg in path.split("/"):
+        if seg == "." or seg == "..":
+            raise gl.vm.UserError(f"{ERR_URL} dot segments are not allowed")
+    if host == "arxiv.org" or host.endswith(".arxiv.org"):
+        m = _ARXIV_PATH_RE.match(path)
+        if m is not None:
+            path = "/abs/" + m.group(1)
+            host = "arxiv.org"
+    return "https://" + host + path
 
 
 def _parse_priority(value: str) -> date:
@@ -455,6 +517,8 @@ class PatentDossier:
     created_at: u256
     pending_challenges: u256
     funder_count: u256
+    queue_head: u256  # first queue slot that may still be pending
+    queue_len: u256  # challenges ever queued against this patent
 
 
 @allow_storage
@@ -489,6 +553,8 @@ class PatentPrior(gl.contract.Contract):
     challenges: TreeMap[u256, PriorArtChallenge]
     verdicts: TreeMap[u256, InvalidationVerdict]  # keyed by challenge id
     claimable: TreeMap[str, u256]  # address hex -> pull-pattern credit
+    queue: TreeMap[str, u256]  # "patent:slot" -> challenge id, FIFO per patent
+    last_payout_at: u256  # newest pull_withdraw / sweep; payouts may be in flight for a while
     challenge_keys: TreeMap[str, bool]  # sha256(patent|url) -> live or adjudicated
     contributions: TreeMap[str, u256]  # "patent:addr" -> wei funded
     funder_slots: TreeMap[str, str]  # "patent:n" -> address hex
@@ -511,6 +577,7 @@ class PatentPrior(gl.contract.Contract):
         self.protocol_vault = 0
         self.total_deposited = 0
         self.total_withdrawn = 0
+        self.last_payout_at = 0
         self.governor = gl.message.sender_address
 
     # ------------------------------------------------------------------ views
@@ -528,7 +595,26 @@ class PatentPrior(gl.contract.Contract):
             "created_at": int(p.created_at),
             "pending_challenges": int(p.pending_challenges),
             "funder_count": int(p.funder_count),
+            "queue_head": int(p.queue_head),
+            "queue_len": int(p.queue_len),
+            "required_bond": str(self._min_bond(p)),
         }
+
+    @gl.public.view
+    def next_evaluable(self, patent_id: u256) -> int:
+        """Id of the challenge that must be evaluated next for this patent (0 if none)."""
+        p = self._patent(patent_id)
+        head = int(p.queue_head)
+        while head < int(p.queue_len):
+            cid = int(self.queue[f"{int(patent_id)}:{head}"])
+            if self.challenges[cid].status == C_PENDING:
+                return cid
+            head += 1
+        return 0
+
+    @gl.public.view
+    def required_bond(self, patent_id: u256) -> str:
+        return str(self._min_bond(self._patent(patent_id)))
 
     @gl.public.view
     def get_challenge(self, challenge_id: u256) -> dict:
@@ -595,13 +681,16 @@ class PatentPrior(gl.contract.Contract):
     def check_url(self, url: str) -> str:
         """Returns the canonical form of an acceptable prior-art URL, or reverts
         with the reason it was refused."""
-        return _normalize_url(url)
+        return _canonicalize_url(url)
 
     @gl.public.view
     def get_constants(self) -> dict:
         return {
             "challenger_bond": str(CHALLENGER_BOND),
             "min_bounty_contribution": str(MIN_BOUNTY_CONTRIBUTION),
+            "bond_bps_of_bounty": BOND_BPS_OF_BOUNTY,
+            "max_pending_per_patent": MAX_PENDING_PER_PATENT,
+            "rescue_grace_seconds": RESCUE_GRACE_SECONDS,
             "max_funders_per_patent": MAX_FUNDERS_PER_PATENT,
             "stale_after_seconds": STALE_AFTER_SECONDS,
             "min_confidence": MIN_CONFIDENCE,
@@ -656,6 +745,8 @@ class PatentPrior(gl.contract.Contract):
             created_at=now,
             pending_challenges=0,
             funder_count=0,
+            queue_head=0,
+            queue_len=0,
         )
         if value > 0:
             self._record_contribution(pid, sender.as_hex.lower(), value)
@@ -711,15 +802,21 @@ class PatentPrior(gl.contract.Contract):
     # ---------------------------------------------------------- challenge life
     @gl.public.write.payable
     def submit_prior_art(self, patent_id: u256, prior_art_url: str, claimed_pub_date: str) -> int:
+        """The attached bond must be at least max(0.1 GEN, 2% of the bounty pool); the
+        whole attached amount is locked and later refunded or slashed."""
         p = self._patent(patent_id)
         if p.status != P_ACTIVE:
             raise gl.vm.UserError(f"{ERR_STATE} patent is not active")
-        if int(gl.message.value) != CHALLENGER_BOND:
-            raise gl.vm.UserError(f"{ERR_BOND} attached {int(gl.message.value)}")
+        value = int(gl.message.value)
+        required = self._min_bond(p)
+        if value < required:
+            raise gl.vm.UserError(f"{ERR_BOND} attached {value}, required {required}")
         sender = gl.message.sender_address
         if sender == p.inventor_address:
             raise gl.vm.UserError(ERR_SELF)
-        url = _normalize_url(prior_art_url)
+        if int(p.pending_challenges) >= MAX_PENDING_PER_PATENT:
+            raise gl.vm.UserError(f"{ERR_QUEUE_FULL} evaluate or void an earlier challenge first")
+        url = _canonicalize_url(prior_art_url)
         claimed = _parse_priority(claimed_pub_date)  # same strict ISO grammar
         key = hashlib.sha256(f"{int(patent_id)}|{url}".encode("utf-8")).hexdigest()
         if key in self.challenge_keys and self.challenge_keys[key]:
@@ -733,15 +830,17 @@ class PatentPrior(gl.contract.Contract):
             challenger_address=sender,
             prior_art_url=url,
             claimed_pub_date=claimed.isoformat(),
-            challenger_bond=CHALLENGER_BOND,
+            challenger_bond=value,
             status=C_PENDING,
             created_at=self._now(),
             disputed_at=0,
         )
+        self.queue[f"{int(patent_id)}:{int(p.queue_len)}"] = cid
+        p.queue_len += 1
         p.pending_challenges += 1
         self.patents[patent_id] = p
-        self.locked_bonds += CHALLENGER_BOND
-        self.total_deposited += CHALLENGER_BOND
+        self.locked_bonds += value
+        self.total_deposited += value
         self._assert_ledger()
         return cid
 
@@ -754,10 +853,15 @@ class PatentPrior(gl.contract.Contract):
             raise gl.vm.UserError(f"{ERR_STATE} challenge is not pending")
         p = self._patent(c.patent_id)
         if p.status != P_ACTIVE:
-            # Another challenge already resolved this patent: nothing left to
-            # adjudicate, so the bond comes straight back.
+            # Defensive: an invalidation voids its pending followers eagerly, so this is
+            # not reachable through normal flow. If it is ever reached, refund.
             self._settle_void(challenge_id, "Patent is no longer active; challenge moot.", 0)
             return V_VOID
+        pid = int(c.patent_id)
+        head = self._advance_head(pid)
+        first = int(self.queue[f"{pid}:{head}"])
+        if first != int(challenge_id):
+            raise gl.vm.UserError(f"{ERR_FIFO} challenge {first} must be evaluated first")
         decision = _run_tribunal(p.patent_title, p.claim_text, p.priority_date, c.prior_art_url)
         outcome = decision["outcome"]
         if outcome == V_INVALIDATED:
@@ -790,6 +894,7 @@ class PatentPrior(gl.contract.Contract):
         self.claimable[key] = 0
         self.claimable_credits -= amount
         self.total_withdrawn += amount
+        self.last_payout_at = self._now()
         try:
             gl.chain.Account(gl.message.sender_address).emit_transfer(amount, on="finalized")
         except Exception:
@@ -814,6 +919,26 @@ class PatentPrior(gl.contract.Contract):
         self._assert_ledger()
 
     @gl.public.write
+    def rescue_excess(self, recipient: str) -> str:
+        """Governor-only. Sends the balance no liability accounts for (stray transfers,
+        donations) to `recipient`: excess = balance - (A + L + C + V). Tracked user
+        liabilities are never touched, and nothing moves while a recent payout may still
+        be in flight, because an emitted-but-unsettled payout also looks like excess."""
+        if gl.message.sender_address != self.governor:
+            raise gl.vm.UserError(f"{ERR_UNAUTHORIZED} governor only")
+        if recipient.lower() == "0x" + "0" * 40:
+            raise gl.vm.UserError(f"{ERR_INPUT} recipient cannot be the zero address")
+        dest = Address(recipient)
+        if self._now() < int(self.last_payout_at) + RESCUE_GRACE_SECONDS:
+            raise gl.vm.UserError(f"{ERR_IN_FLIGHT} a payout was emitted within the grace window")
+        excess = int(self.balance) - self._tracked()
+        if excess <= 0:
+            raise gl.vm.UserError(ERR_NO_EXCESS)
+        gl.chain.Account(dest).emit_transfer(excess, on="finalized")
+        self._assert_ledger()
+        return str(excess)
+
+    @gl.public.write
     def transfer_governor(self, new_governor_hex: str) -> None:
         if gl.message.sender_address != self.governor:
             raise gl.vm.UserError(f"{ERR_UNAUTHORIZED} governor only")
@@ -834,6 +959,22 @@ class PatentPrior(gl.contract.Contract):
 
     def _now(self) -> int:
         return int(datetime.now(timezone.utc).timestamp())
+
+    def _min_bond(self, p: PatentDossier) -> int:
+        scaled = int(p.active_bounty) * BOND_BPS_OF_BOUNTY // 10000
+        return scaled if scaled > CHALLENGER_BOND else CHALLENGER_BOND
+
+    def _advance_head(self, pid: int) -> int:
+        """Move the queue head past settled challenges; returns the head slot."""
+        p = self.patents[pid]
+        head = int(p.queue_head)
+        n = int(p.queue_len)
+        while head < n and self.challenges[int(self.queue[f"{pid}:{head}"])].status != C_PENDING:
+            head += 1
+        if head != int(p.queue_head):
+            p.queue_head = head
+            self.patents[pid] = p
+        return head
 
     def _tracked(self) -> int:
         return (
@@ -902,6 +1043,13 @@ class PatentPrior(gl.contract.Contract):
         self.active_bounties -= bounty
         self._credit(c.challenger_address.as_hex, int(c.challenger_bond) + bounty)
         self._store_verdict(challenge_id, decision)
+        # The claim is gone, so everything queued behind this challenge is moot: void it
+        # and refund each bond in full, now, rather than leaving it to be evaluated.
+        pid = int(c.patent_id)
+        for slot in range(int(p.queue_head), int(p.queue_len)):
+            other = int(self.queue[f"{pid}:{slot}"])
+            if other != int(challenge_id) and self.challenges[other].status == C_PENDING:
+                self._settle_void(other, f"Voided: challenge {int(challenge_id)} invalidated the patent first.", 0)
         self._assert_ledger()
 
     def _settle_rejected(self, challenge_id: u256, decision: dict) -> None:

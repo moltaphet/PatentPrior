@@ -43,7 +43,7 @@ def pytest_terminal_summary(terminalreporter):
 CONTRACT = "contracts/patent_prior.py"
 GEN = 10**18
 BOND = GEN // 10
-MIN_CONTRIB = GEN // 1000
+MIN_CONTRIB = GEN // 20
 DAY = 86400
 
 PRIORITY = "2020-06-15"
@@ -69,7 +69,14 @@ def register(c, vm, who, bounty=0, title=TITLE, priority=PRIORITY, claim=CLAIM):
     return pid
 
 
-def submit(c, vm, who, pid, url=ARXIV, claimed="2018-01-02", value=BOND):
+def required_bond(c, pid) -> int:
+    return int(c.required_bond(pid))
+
+
+def submit(c, vm, who, pid, url=ARXIV, claimed="2018-01-02", value=None):
+    """Submit with the bond the contract currently requires unless `value` is given."""
+    if value is None:
+        value = required_bond(c, pid)
     fund(vm, who)
     vm.sender = who
     vm.value = value

@@ -8,6 +8,10 @@ Case 2  hardware architecture, prior art post-dates priority    -> VALID, bond s
 Case 3  dead link                                               -> AMBIGUOUS_VOID, full refund
 Case 4  active patent open for community prior-art submissions  -> stays ACTIVE
 
+Also demonstrated live: FIFO adjudication (a second challenger queued behind case 1 is
+voided and refunded when case 1 invalidates the patent) and rescue_excess (stray funds
+credited to the contract by the simulator are swept by the governor).
+
 The tribunal is a live multi-validator LLM round, so outcomes are observed, not
 scripted: the run records what consensus decided and exits non-zero if that
 differs from the expectation above.
@@ -21,11 +25,13 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+from eth_typing import ChecksumAddress
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from chain import EXPLORER, GEN, ROOT, Chain, load_or_create_key  # noqa: E402
+from chain import EXPLORER, GEN, ROOT, Chain, load_or_create_key, retry  # noqa: E402
 
 DEPLOYMENT = ROOT / "deployments" / "studio-next.json"
 PROGRESS = ROOT / ".keys" / "live-progress.json"  # resumable: completed steps are never re-sent
@@ -198,13 +204,29 @@ def main() -> int:
         pid = int(progress.setdefault(f"case{n}.pid", int(inv.view("get_patent_count"))))
         PROGRESS.write_text(json.dumps(progress, indent=2))
         reg_rec = log_tx("register_patent", reg)
+        bond = int(chal.view("required_bond", [pid]))
         sub, cached = step(progress, f"case{n}.submit", chal, "submit_prior_art",
-                           [pid, case["url"], case["claimed"]], value=BOND)
+                           [pid, case["url"], case["claimed"]], value=bond)
         if not cached:
             progress[f"case{n}.cid"] = int(chal.view("get_challenge_count"))
         cid = int(progress.setdefault(f"case{n}.cid", int(chal.view("get_challenge_count"))))
         PROGRESS.write_text(json.dumps(progress, indent=2))
         sub_rec = log_tx("submit_prior_art (0.1 GEN bond)", sub)
+        follower: dict[str, Any] | None = None
+        if n == 1:
+            # a second challenger queues behind case 1, citing a different paper (spelled with a
+            # version suffix that canonicalisation must fold into the canonical arXiv abs URL)
+            c2 = actors["challenger2"]
+            fsub, cached = step(progress, "case1.follower.submit", c2, "submit_prior_art",
+                                [pid, "https://arxiv.org/abs/1706.03762v7", "2017-06-12"],
+                                value=int(c2.view("required_bond", [pid])))
+            if not cached:
+                progress["case1.follower.cid"] = int(c2.view("get_challenge_count"))
+            fcid = int(progress.setdefault("case1.follower.cid", int(c2.view("get_challenge_count"))))
+            PROGRESS.write_text(json.dumps(progress, indent=2))
+            follower = {"challenge_id": fcid, "submit": log_tx("submit_prior_art (follower, queued behind #1)", fsub)}
+            fch = c2.view("get_challenge", [fcid])
+            print(f"  follower #{fcid} stored url={fch['prior_art_url']} status={fch['status']} (canonicalised, queued)")
         ev, _ = step(progress, f"case{n}.evaluate", chal, "evaluate_prior_art", [cid], simulate=False)
         ev_rec = log_tx("evaluate_prior_art", ev)
 
@@ -222,8 +244,21 @@ def main() -> int:
               f"inventor={inv.view('claimable_of', [inv.address.lower()])}\n")
         if not ok:
             failures.append(f"case {n}: got {outcome}, expected {case['expect']}")
+        if follower is not None:
+            c2 = actors["challenger2"]
+            fch = c2.view("get_challenge", [follower["challenge_id"]])
+            fverdict = c2.view("get_verdict", [follower["challenge_id"]])
+            fcredit = int(c2.view("claimable_of", [c2.address.lower()]))
+            fok = (fch["status"] == "VOIDED" and fverdict["outcome"] == "AMBIGUOUS_VOID"
+                   and fcredit == int(fch["challenger_bond"]))
+            print(f"  FIFO     follower #{follower['challenge_id']} status={fch['status']} refund_credit={fcredit} "
+                  f"{'OK' if fok else 'MISMATCH'}")
+            if not fok:
+                failures.append("FIFO follower was not voided and refunded when case 1 invalidated the patent")
+            follower.update(status=fch["status"], verdict=fverdict, refund_credit_wei=str(fcredit), ok=fok,
+                            stored_url=fch["prior_art_url"])
         record(
-            case, patent_id=pid, challenge_id=cid, expected=case["expect"], outcome=outcome,
+            case, follower=follower, patent_id=pid, challenge_id=cid, expected=case["expect"], outcome=outcome,
             patent_status=patent["status"], challenge_status=challenge["status"], verdict=verdict,
             inventor=inv.address, challenger=chal.address, source_url=case["url"],
             txs={"register_patent": reg_rec, "submit_prior_art": sub_rec, "evaluate_prior_art": ev_rec},
@@ -251,6 +286,31 @@ def main() -> int:
     record(c4, patent_id=pid4, expected="ACTIVE", outcome=p4["status"], patent_status=p4["status"],
            active_bounty_wei=p4["active_bounty"], inventor=inv4.address, funder=funder.address,
            txs={"register_patent": reg_rec, "fund_bounty": fund_rec})
+
+    # ---- rescue_excess: stray funds credited to the contract, swept by the governor --------
+    print("== rescue_excess")
+    rescue: dict[str, Any] = {}
+    stray = GEN * 3 // 10
+    before = deployer.view("get_ledger")
+    retry(lambda: deployer.client.fund_account(cast(ChecksumAddress, address), stray))  # simulator credit
+    time.sleep(3)
+    mid = deployer.view("get_ledger")
+    excess = int(mid["contract_balance"]) - int(mid["tracked_total"])
+    print(f"  stray funds credited: balance {int(before['contract_balance']) / GEN} -> {int(mid['contract_balance']) / GEN} GEN, "
+          f"tracked {int(mid['tracked_total']) / GEN} GEN, excess {excess / GEN} GEN")
+    if excess == stray:
+        rr, _ = step(progress, "rescue_excess", deployer, "rescue_excess", [deployer.address.lower()])
+        rrec = log_tx("rescue_excess (governor)", rr)
+        end = deployer.view("get_ledger")
+        untouched = all(end[k] == mid[k] for k in ("active_bounties", "locked_bonds", "claimable_credits",
+                                                   "protocol_vault", "tracked_total", "total_deposited", "total_withdrawn"))
+        print(f"  tracked liabilities untouched: {untouched}; balance now {int(end['contract_balance']) / GEN} GEN")
+        rescue = {"stray_wei": str(stray), "excess_wei": str(excess), "tracked_untouched": untouched,
+                  "balance_after_wei": end["contract_balance"], "tx": rrec}
+        if not untouched:
+            failures.append("rescue_excess changed tracked liabilities")
+    else:
+        failures.append(f"expected excess {stray} after the simulator credit, saw {excess}")
 
     # ---- settlement: pull withdrawals + governor sweep --------------------------------
     print("== Settlement (pull pattern)")
@@ -296,6 +356,7 @@ def main() -> int:
         "recorded_at": now(),
         "cases": proofs,
         "settlement": settle,
+        "rescue_excess": rescue,
         "final_ledger": ledger,
         "failures": failures,
         "actors": {n: ch.address for n, ch in actors.items()},
