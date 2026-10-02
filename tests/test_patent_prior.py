@@ -151,7 +151,7 @@ def test_arxiv_version_canonicalization_blocks_frontrunning(direct_vm, direct_de
         ("https://DOI.ORG/10.1000/XYZ/", "https://doi.org/10.1000/XYZ"),
         ("https://doi.org/10.1000/a%41b", "https://doi.org/10.1000/aAb"),
         ("https://doi.org/10.1000/a%2fb", "https://doi.org/10.1000/a%2Fb"),
-        ("https://www.rfc-editor.org/rfc/rfc9000///", "https://www.rfc-editor.org/rfc/rfc9000"),
+        ("https://www.rfc-editor.org/rfc/rfc9000///", "https://rfc-editor.org/rfc/rfc9000"),
         ("https://arxiv.org/abs/notanid", "https://arxiv.org/abs/notanid"),  # unknown shapes are left alone
     ],
 )
@@ -283,9 +283,10 @@ def test_rescue_excess_preserves_accounting_invariants(direct_vm, direct_deploy,
     assert tracked == 3 * GEN + BOND + BOND // 2 + BOND // 2  # bounty + locked + credit + vault
     seed_excess(direct_vm, c, 7 * GEN // 10)
     assert c.get_ledger()["contract_balance"] == str(tracked + 7 * GEN // 10)
-    sink = make_account(0xBB)
     direct_vm.sender = direct_owner
-    assert c.rescue_excess(hx(sink)) == str(7 * GEN // 10)
+    sent = capture_transfers(direct_vm)
+    assert c.rescue_excess() == str(7 * GEN // 10)
+    assert sent == [(hx(direct_owner), 7 * GEN // 10, "finalized")]  # exactly the excess, to the governor
     after = c.get_ledger()
     for k in ("active_bounties", "locked_bonds", "claimable_credits", "protocol_vault", "tracked_total",
               "total_deposited", "total_withdrawn"):
@@ -295,28 +296,25 @@ def test_rescue_excess_preserves_accounting_invariants(direct_vm, direct_deploy,
     # excess that remains: with no new surplus it is refused
     direct_vm.deal(c.address, tracked)
     with direct_vm.expect_revert("ERR_NO_EXCESS_BALANCE"):
-        c.rescue_excess(hx(sink))
+        c.rescue_excess()
     assert_solvent(c)
 
 
 def test_rescue_excess_guards(direct_vm, direct_deploy, direct_alice, direct_bob, direct_owner):
     c = direct_deploy(CONTRACT)
     register(c, direct_vm, direct_alice, bounty=GEN)
-    sink = make_account(0xBB)
     for who in (direct_alice, direct_bob):
         direct_vm.sender = who
         with direct_vm.expect_revert("ERR_UNAUTHORIZED"):
-            c.rescue_excess(hx(sink))
+            c.rescue_excess()
     direct_vm.sender = direct_owner
     with direct_vm.expect_revert("ERR_NO_EXCESS_BALANCE"):  # balance 0 < tracked
-        c.rescue_excess(hx(sink))
+        c.rescue_excess()
     seed_excess(direct_vm, c, 0)
     with direct_vm.expect_revert("ERR_NO_EXCESS_BALANCE"):  # balance == tracked exactly
-        c.rescue_excess(hx(sink))
+        c.rescue_excess()
     seed_excess(direct_vm, c, 1)
-    with direct_vm.expect_revert("ERR_INVALID_INPUT"):
-        c.rescue_excess("0x" + "0" * 40)
-    assert c.rescue_excess(hx(sink)) == "1"  # one wei of surplus is enough
+    assert c.rescue_excess() == "1"  # one wei of surplus is enough
 
 
 def test_rescue_waits_out_in_flight_payouts(direct_vm, direct_deploy, direct_alice, direct_bob, direct_owner):
@@ -328,16 +326,15 @@ def test_rescue_waits_out_in_flight_payouts(direct_vm, direct_deploy, direct_ali
     seed_excess(direct_vm, c, 0)  # balance == tracked (1.1 GEN credited to bob)
     direct_vm.sender = direct_bob
     c.pull_withdraw()
-    sink = make_account(0xBB)
     direct_vm.sender = direct_owner
     with direct_vm.expect_revert("ERR_PAYOUTS_IN_FLIGHT"):
-        c.rescue_excess(hx(sink))
+        c.rescue_excess()
     last = int(c.get_constants()["rescue_grace_seconds"])
     warp_to(direct_vm, __import__("time").time() + last - 60)
     with direct_vm.expect_revert("ERR_PAYOUTS_IN_FLIGHT"):
-        c.rescue_excess(hx(sink))
+        c.rescue_excess()
     warp_to(direct_vm, __import__("time").time() + last + 60)
-    assert int(c.rescue_excess(hx(sink))) == BOND + GEN
+    assert int(c.rescue_excess()) == BOND + GEN
 
 
 def test_rescue_cannot_touch_vault_credits_or_bonds(direct_vm, direct_deploy, direct_alice, direct_bob, direct_owner):
@@ -348,7 +345,7 @@ def test_rescue_cannot_touch_vault_credits_or_bonds(direct_vm, direct_deploy, di
     direct_vm.deal(c.address, int(L["tracked_total"]) - 1)  # one wei short of solvent
     direct_vm.sender = direct_owner
     with direct_vm.expect_revert("ERR_NO_EXCESS_BALANCE"):
-        c.rescue_excess(hx(make_account(0xBB)))
+        c.rescue_excess()
     assert c.get_ledger()["protocol_vault"] == L["protocol_vault"]
     assert c.get_ledger()["claimable_credits"] == L["claimable_credits"]
 
@@ -399,3 +396,234 @@ def test_dust_cannot_exhaust_the_backer_slots(direct_vm, direct_deploy, direct_a
     direct_vm.sender, direct_vm.value = legit, GEN // 20
     c.fund_bounty(pid)
     assert c.get_patent(pid)["funder_count"] == 1
+
+
+# ------------------------------------------------------------------ v2.1: bounty freeze
+def test_cannot_fund_bounty_while_challenge_pending(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    c = direct_deploy(CONTRACT)
+    pid = register(c, direct_vm, direct_alice, bounty=GEN)
+    cid = submit(c, direct_vm, direct_bob, pid)
+    bond_before = required_bond(c, pid)
+    fund(direct_vm, direct_charlie, 5000 * GEN)
+    for amt in (GEN // 20, GEN, 100 * GEN):
+        direct_vm.sender, direct_vm.value = direct_charlie, amt
+        with direct_vm.expect_revert("ERR_CHALLENGE_IN_PROGRESS"):
+            c.fund_bounty(pid)
+    with direct_vm.expect_revert("cannot increase bounty while challenges are pending evaluation"):
+        c.fund_bounty(pid)
+    p = c.get_patent(pid)
+    assert p["active_bounty"] == str(GEN)           # the pool the bond was priced against is unchanged
+    assert required_bond(c, pid) == bond_before
+    assert p["funder_count"] == 1
+    assert c.contribution_of(pid, hx(direct_charlie)) == "0"
+    assert assert_solvent(c)["active_bounties"] == str(GEN)
+    # the inventor cannot top up their own pool mid-challenge either
+    direct_vm.sender, direct_vm.value = direct_alice, GEN
+    with direct_vm.expect_revert("ERR_CHALLENGE_IN_PROGRESS"):
+        c.fund_bounty(pid)
+    # a second challenger therefore posts the same bond against the same pool
+    assert submit(c, direct_vm, direct_charlie, pid, url="https://arxiv.org/abs/1801.00002") == 2
+    assert c.get_challenge(2)["challenger_bond"] == c.get_challenge(cid)["challenger_bond"]
+    # once nothing is pending, funding reopens
+    mock_source(direct_vm, r"arxiv\.org", "2022-02-02")
+    mock_tribunal(direct_vm, pub="2022-02-02")
+    direct_vm.sender = direct_bob
+    assert c.evaluate_prior_art(1) == "VALID"
+    direct_vm.sender, direct_vm.value = direct_charlie, GEN
+    with direct_vm.expect_revert("ERR_CHALLENGE_IN_PROGRESS"):  # challenge 2 is still pending
+        c.fund_bounty(pid)
+    direct_vm.sender = direct_charlie
+    assert c.evaluate_prior_art(2) == "VALID"
+    direct_vm.sender, direct_vm.value = direct_charlie, GEN
+    c.fund_bounty(pid)
+    assert c.get_patent(pid)["active_bounty"] == str(2 * GEN)
+    assert_solvent(c)
+
+
+def test_funding_reopens_after_a_stale_void(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    c = direct_deploy(CONTRACT)
+    pid = register(c, direct_vm, direct_alice, bounty=GEN)
+    cid = submit(c, direct_vm, direct_bob, pid)
+    fund(direct_vm, direct_charlie)
+    direct_vm.sender, direct_vm.value = direct_charlie, GEN
+    with direct_vm.expect_revert("ERR_CHALLENGE_IN_PROGRESS"):
+        c.fund_bounty(pid)
+    warp_to(direct_vm, c.get_challenge(cid)["created_at"] + WEEK)
+    direct_vm.value = 0
+    c.void_stale_challenge(cid)
+    direct_vm.value = GEN
+    c.fund_bounty(pid)
+    assert c.get_patent(pid)["active_bounty"] == str(2 * GEN)
+
+
+# ------------------------------------------------------------- v2.1: global www canonical
+@pytest.mark.parametrize(
+    "host,path",
+    [
+        ("nature.com", "/articles/s41586-019-1666-5"),
+        ("rfc-editor.org", "/rfc/rfc9000"),
+        ("w3.org", "/TR/webauthn-2"),
+        ("springer.com", "/journal/1"),
+        ("sciencedirect.com", "/science/article/pii/S0000"),
+        ("biorxiv.org", "/content/10.1101/2019.12.01"),
+        ("doi.org", "/10.1000/xyz123"),
+        ("arxiv.org", "/abs/1801.00001"),
+        ("patents.google.com", "/patent/US1234567A/en"),
+    ],
+)
+def test_global_www_canonicalization_deduplication(direct_vm, direct_deploy, direct_alice, direct_bob, host, path):
+    c = direct_deploy(CONTRACT)
+    canonical = f"https://{host}{path}"
+    spellings = [f"https://{host}{path}", f"https://www.{host}{path}", f"https://WWW.{host.upper()}{path}",
+                 f"https://www.www.{host}{path}", f"https://www.{host}:443{path}/", f"https://www.{host}{path}?utm=1#x"]
+    for sp in spellings:
+        assert c.check_url(sp) == canonical, sp
+    pid = register(c, direct_vm, direct_alice, bounty=GEN)
+    first = submit(c, direct_vm, direct_bob, pid, url=f"https://www.{host}{path}")
+    assert c.get_challenge(first)["prior_art_url"] == canonical  # stored without www
+    for sp in spellings:  # every other spelling is the same citation
+        fund(direct_vm, make_account(30))
+        direct_vm.sender, direct_vm.value = make_account(30), BOND
+        with direct_vm.expect_revert("ERR_DUPLICATE_CHALLENGE"):
+            c.submit_prior_art(pid, sp, "2018-01-02")
+    assert c.get_challenge_count() == 1
+
+
+def test_www_stripping_is_leading_only_and_whole_label(direct_vm, direct_deploy):
+    c = direct_deploy(CONTRACT)
+    assert c.check_url("https://arxiv.org/abs/www.1801") == "https://arxiv.org/abs/www.1801"  # path untouched
+    assert c.check_url("https://export.arxiv.org/abs/1801.00001v2") == "https://arxiv.org/abs/1801.00001"
+    assert c.check_url("https://a.www.nature.com/x") == "https://a.www.nature.com/x"  # not leading
+    for bad in ("https://www.evil.com/x", "https://wwwarxiv.org/x", "https://www.arxiv.org.evil.com/x",
+                "https://www.web.archive.org/x"):
+        with direct_vm.expect_revert("ERR_UNSAFE_URL"):  # the whitelist runs before and after
+            c.check_url(bad)
+
+
+# ------------------------------------------------------------ v2.1: rescue destination
+def test_rescue_excess_only_sends_to_governor(direct_vm, direct_deploy, direct_alice, direct_bob, direct_owner):
+    c = direct_deploy(CONTRACT)
+    register(c, direct_vm, direct_alice, bounty=GEN)
+    sent = capture_transfers(direct_vm)
+    seed_excess(direct_vm, c, 123)
+
+    # there is no recipient argument to abuse
+    direct_vm.sender = direct_owner
+    for args in ((hx(direct_bob),), (hx(direct_owner),), ("0x" + "0" * 40,)):
+        with pytest.raises(Exception):
+            c.rescue_excess(*args)
+    assert sent == []
+
+    # nobody but the governor can call it, and the funds never go to the caller of record
+    for who in (direct_alice, direct_bob):
+        direct_vm.sender = who
+        with direct_vm.expect_revert("ERR_UNAUTHORIZED"):
+            c.rescue_excess()
+    assert sent == []
+
+    direct_vm.sender = direct_owner
+    assert c.rescue_excess() == "123"
+    assert sent == [(hx(direct_owner), 123, "finalized")]
+
+    # rotate the governor: the destination follows the *current* governor, and only that key can call
+    direct_vm.sender = direct_owner
+    c.transfer_governor(hx(direct_bob))
+    seed_excess(direct_vm, c, 77)
+    with direct_vm.expect_revert("ERR_UNAUTHORIZED"):
+        c.rescue_excess()
+    direct_vm.sender = direct_bob
+    assert c.rescue_excess() == "77"
+    assert sent[-1] == (hx(direct_bob), 77, "finalized")
+    assert len(sent) == 2
+    assert all(dest in (hx(direct_owner), hx(direct_bob)) for dest, _, _ in sent)
+
+
+def test_rescue_blocked_for_24h_after_any_withdrawal(direct_vm, direct_deploy, direct_alice, direct_bob, direct_owner):
+    """Including the governor's own withdrawal, and exactly at the 24h boundary."""
+    c = direct_deploy(CONTRACT)
+    pid = register(c, direct_vm, direct_alice, bounty=GEN)
+    run_challenge(c, direct_vm, direct_bob, pid, "https://arxiv.org/abs/2201.00001", "2022-01-01")
+    direct_vm.sender = direct_owner
+    c.sweep_vault(hx(direct_owner), BOND // 2)
+    sent = capture_transfers(direct_vm)
+    seed_excess(direct_vm, c, 500)
+    t0 = __import__("time").time()
+    direct_vm.sender = direct_owner
+    c.pull_withdraw()  # the governor's own withdrawal starts the clock
+    for off in (0, 3600, 86400 - 120):
+        warp_to(direct_vm, t0 + off)
+        with direct_vm.expect_revert("ERR_PAYOUTS_IN_FLIGHT"):
+            c.rescue_excess()
+    assert len(sent) == 1  # only the withdrawal itself was emitted; every rescue attempt was refused
+    warp_to(direct_vm, t0 + 86400 + 120)
+    rescued = int(c.rescue_excess())
+    assert rescued > 0
+    assert len(sent) == 2 and sent[1] == (hx(direct_owner), rescued, "finalized")
+
+
+# ------------------------------------------------------- v2.1: head-of-line blocking
+def test_blocking_head_challenge_voidable_after_24h(direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie):
+    c = direct_deploy(CONTRACT)
+    pid = register(c, direct_vm, direct_alice, bounty=GEN)
+    head = submit(c, direct_vm, direct_bob, pid, url="https://arxiv.org/abs/2201.00001")
+    follower = submit(c, direct_vm, direct_charlie, pid, url="https://arxiv.org/abs/2201.00002")
+    t0 = c.get_challenge(head)["created_at"]
+    stranger = make_account(90)
+    assert c.get_constants()["blocking_stale_after_seconds"] == DAY
+    direct_vm.sender = stranger
+    warp_to(direct_vm, t0 + DAY - 1)
+    with direct_vm.expect_revert("ERR_NOT_STALE"):
+        c.void_stale_challenge(head)
+    # the follower is not the head, so it gets no shortcut at the same moment
+    warp_to(direct_vm, c.get_challenge(follower)["created_at"] + DAY + 1)
+    with direct_vm.expect_revert("ERR_NOT_STALE"):
+        c.void_stale_challenge(follower)
+    warp_to(direct_vm, t0 + DAY)
+    c.void_stale_challenge(head)
+    assert c.get_challenge(head)["status"] == "VOIDED"
+    assert credit(c, direct_bob) == BOND
+    assert c.next_evaluable(pid) == follower
+    # nobody is queued behind the follower any more, so it is back to the seven day window
+    warp_to(direct_vm, c.get_challenge(follower)["created_at"] + 2 * DAY)
+    with direct_vm.expect_revert("ERR_NOT_STALE"):
+        c.void_stale_challenge(follower)
+    direct_vm.clear_mocks()
+    mock_source(direct_vm, r"arxiv\.org", "2022-02-02")
+    mock_tribunal(direct_vm, pub="2022-02-02")
+    direct_vm.sender = direct_charlie
+    assert c.evaluate_prior_art(follower) == "VALID"  # queue throughput restored
+    assert_solvent(c)
+
+
+def test_lone_challenge_keeps_the_seven_day_window(direct_vm, direct_deploy, direct_alice, direct_bob):
+    c = direct_deploy(CONTRACT)
+    pid = register(c, direct_vm, direct_alice)
+    cid = submit(c, direct_vm, direct_bob, pid)
+    t0 = c.get_challenge(cid)["created_at"]
+    direct_vm.sender = make_account(90)
+    for off in (DAY, 3 * DAY, WEEK - 1):
+        warp_to(direct_vm, t0 + off)
+        with direct_vm.expect_revert("ERR_NOT_STALE"):
+            c.void_stale_challenge(cid)
+    warp_to(direct_vm, t0 + WEEK)
+    c.void_stale_challenge(cid)
+    assert credit(c, direct_bob) == BOND
+
+
+def test_a_full_queue_of_blocked_challenges_drains_in_24h_steps(direct_vm, direct_deploy, direct_alice):
+    """Each head that is stale-voided hands the block to the next one; with n challenges the whole
+    queue is cleared in n-1 daily steps plus the last one's seven days, never wedged forever."""
+    c = direct_deploy(CONTRACT)
+    pid = register(c, direct_vm, direct_alice, bounty=GEN)
+    who = [make_account(120 + i) for i in range(4)]
+    cids = [submit(c, direct_vm, w, pid, url=f"https://arxiv.org/abs/2201.0010{i}") for i, w in enumerate(who)]
+    t = max(c.get_challenge(i)["created_at"] for i in cids)
+    direct_vm.sender = make_account(91)
+    for step, cid in enumerate(cids[:-1], start=1):
+        warp_to(direct_vm, t + step * DAY)
+        c.void_stale_challenge(cid)
+        assert c.get_challenge(cid)["status"] == "VOIDED"
+        assert c.next_evaluable(pid) == cids[step]
+    assert c.get_patent(pid)["pending_challenges"] == 1
+    assert all(credit(c, w) == BOND for w in who[:-1])
+    assert_solvent(c)

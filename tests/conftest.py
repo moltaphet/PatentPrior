@@ -161,3 +161,18 @@ def run_challenge(c, vm, challenger, pid, url, pub, evaluator=None, **kw):
 
 def credit(c, who) -> int:
     return int(c.claimable_of(hx(who)))
+
+
+def capture_transfers(vm) -> list:
+    """Record every transfer the contract emits, as (destination hex, value, stage). The direct
+    harness does not execute emitted messages, so this hook is how a test sees where value is sent."""
+    sent: list = []
+
+    def hook(_vm, req):
+        msg = req.get("EmitInternalMessage") if isinstance(req, dict) else None
+        if msg is not None:
+            sent.append(("0x" + bytes(msg["address"].as_bytes).hex(), int(msg["value"]), msg["on"]))
+        return None
+
+    vm._gl_call_hook = hook
+    return sent

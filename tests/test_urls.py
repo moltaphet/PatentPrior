@@ -20,11 +20,11 @@ VALID = [
     ("https://dl.acm.org/doi/10.1145/3000000", "https://dl.acm.org/doi/10.1145/3000000"),
     ("https://doi.org/10.1000/xyz123", "https://doi.org/10.1000/xyz123"),
     ("https://datatracker.ietf.org/doc/rfc9000", "https://datatracker.ietf.org/doc/rfc9000"),
-    ("https://www.rfc-editor.org/rfc/rfc9000", "https://www.rfc-editor.org/rfc/rfc9000"),
-    ("https://www.w3.org/TR/webauthn-2/", "https://www.w3.org/TR/webauthn-2"),
+    ("https://www.rfc-editor.org/rfc/rfc9000", "https://rfc-editor.org/rfc/rfc9000"),
+    ("https://www.w3.org/TR/webauthn-2/", "https://w3.org/TR/webauthn-2"),
     ("https://eprint.iacr.org/2019/001", "https://eprint.iacr.org/2019/001"),
-    ("https://www.nature.com/articles/s41586-019-1666-5", "https://www.nature.com/articles/s41586-019-1666-5"),
-    ("https://www.biorxiv.org/content/10.1101/2019.12.01/", "https://www.biorxiv.org/content/10.1101/2019.12.01"),
+    ("https://www.nature.com/articles/s41586-019-1666-5", "https://nature.com/articles/s41586-019-1666-5"),
+    ("https://www.biorxiv.org/content/10.1101/2019.12.01/", "https://biorxiv.org/content/10.1101/2019.12.01"),
 ]
 
 SCHEMES = [

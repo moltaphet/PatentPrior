@@ -31,6 +31,12 @@
 # pending followers of an invalidating challenge are voided and refunded at once; and the
 # governor can rescue balance that no liability accounts for (rescue_excess).
 #
+# v2.1: rescue_excess takes no recipient (it pays the governor, nobody else) and refuses to run
+# within 24 h of any payout; fund_bounty is frozen while a challenge is pending, so the bond a
+# challenger posts always matches the whole pool under evaluation; every URL loses a leading
+# "www."; and a challenge that is blocking others at the head of its queue can be stale-voided
+# after 24 h instead of 7 days.
+#
 # Every payout is a credit; value leaves only through pull_withdraw (pull
 # pattern). The ledger identity
 #
@@ -61,6 +67,7 @@ MAX_PENDING_PER_PATENT = 16  # bounds the FIFO queue scans and the follower-void
 RESCUE_GRACE_SECONDS = 24 * 3600  # payouts emitted this recently may still be in flight
 MAX_FUNDERS_PER_PATENT = 32  # bounds the expiry refund loop
 STALE_AFTER_SECONDS = 7 * 24 * 3600
+BLOCKING_STALE_AFTER_SECONDS = 24 * 3600  # head challenge with others queued behind it
 MIN_CONFIDENCE = 60  # below this the tribunal's finding is treated as ambiguous
 DEFENDER_SHARE_NUM = 1
 DEFENDER_SHARE_DEN = 2  # slashed bond: floor(1/2) to defender, remainder to vault
@@ -105,6 +112,7 @@ ERR_FUNDERS = "ERR_FUNDER_LIMIT"
 ERR_TRANSFER = "ERR_TRANSFER_FAILED_RESTORED"
 ERR_INVARIANT = "ERR_SOLVENCY_INVARIANT_BROKEN"
 ERR_FIFO = "ERR_FIFO_ORDER"
+ERR_IN_PROGRESS = "ERR_CHALLENGE_IN_PROGRESS"
 ERR_QUEUE_FULL = "ERR_CHALLENGE_QUEUE_FULL"
 ERR_NO_EXCESS = "ERR_NO_EXCESS_BALANCE"
 ERR_IN_FLIGHT = "ERR_PAYOUTS_IN_FLIGHT"
@@ -224,7 +232,8 @@ def _canonicalize_url(url: str) -> str:
     """One canonical spelling per source: validated and whitelisted (see _normalize_url),
     then lower-case host, no query, no fragment, no trailing slash, no duplicate or dot
     segments, and for arXiv the version suffix, /pdf/ and /html/ spellings and the
-    www/export mirrors folded into https://arxiv.org/abs/<id>. This is the string that is
+    export mirror folded into https://arxiv.org/abs/<id>; every host also loses a leading "www.".
+    This is the string that is
     stored, hashed for duplicate detection, and fetched."""
     norm = _normalize_url(url)
     rest = norm[8:]
@@ -242,6 +251,8 @@ def _canonicalize_url(url: str) -> str:
     for seg in path.split("/"):
         if seg == "." or seg == "..":
             raise gl.vm.UserError(f"{ERR_URL} dot segments are not allowed")
+    while host.startswith("www."):  # www.x and x name the same publisher; one spelling only
+        host = host[4:]
     if host == "arxiv.org" or host.endswith(".arxiv.org"):
         m = _ARXIV_PATH_RE.match(path)
         if m is not None:
@@ -693,6 +704,7 @@ class PatentPrior(gl.contract.Contract):
             "rescue_grace_seconds": RESCUE_GRACE_SECONDS,
             "max_funders_per_patent": MAX_FUNDERS_PER_PATENT,
             "stale_after_seconds": STALE_AFTER_SECONDS,
+            "blocking_stale_after_seconds": BLOCKING_STALE_AFTER_SECONDS,
             "min_confidence": MIN_CONFIDENCE,
             "allowed_domains": list(ALLOWED_DOMAINS),
         }
@@ -760,6 +772,12 @@ class PatentPrior(gl.contract.Contract):
         p = self._patent(patent_id)
         if p.status != P_ACTIVE:
             raise gl.vm.UserError(f"{ERR_STATE} patent is not active")
+        if int(p.pending_challenges) > 0:
+            # the bond a challenger posted was sized to the pool at submission; growing the pool
+            # now would put more at stake than that bond was priced for
+            raise gl.vm.UserError(
+                f"{ERR_IN_PROGRESS}: cannot increase bounty while challenges are pending evaluation"
+            )
         value = int(gl.message.value)
         if value < MIN_BOUNTY_CONTRIBUTION:
             raise gl.vm.UserError(f"{ERR_VALUE} below minimum contribution")
@@ -874,14 +892,24 @@ class PatentPrior(gl.contract.Contract):
 
     @gl.public.write
     def void_stale_challenge(self, challenge_id: u256) -> None:
-        """Escape valve: anyone may void a challenge that has sat unresolved for
-        seven days. Principal is refunded in full."""
+        """Escape valve: anyone may void a challenge that has sat unresolved for seven days
+        (24 hours if it is the head of its patent's queue and others are waiting behind it).
+        Principal is refunded in full."""
         c = self._challenge(challenge_id)
         if c.status != C_PENDING:
             raise gl.vm.UserError(f"{ERR_STATE} challenge is not pending")
-        if self._now() < int(c.created_at) + STALE_AFTER_SECONDS:
-            raise gl.vm.UserError(f"{ERR_NOT_STALE} seven days have not elapsed")
-        self._settle_void(challenge_id, "Voided after the seven day stale timeout.", 0)
+        window = STALE_AFTER_SECONDS
+        reason = "Voided after the seven day stale timeout."
+        pid = int(c.patent_id)
+        if int(self.patents[pid].pending_challenges) > 1:
+            head = self._advance_head(pid)
+            if int(self.queue[f"{pid}:{head}"]) == int(challenge_id):
+                # an unresolvable head halts every challenge queued behind it, so it gets less time
+                window = BLOCKING_STALE_AFTER_SECONDS
+                reason = "Voided after the 24 hour timeout: it was blocking the queue."
+        if self._now() < int(c.created_at) + window:
+            raise gl.vm.UserError(f"{ERR_NOT_STALE} stale window has not elapsed")
+        self._settle_void(challenge_id, reason, 0)
 
     @gl.public.write
     def pull_withdraw(self) -> str:
@@ -919,22 +947,19 @@ class PatentPrior(gl.contract.Contract):
         self._assert_ledger()
 
     @gl.public.write
-    def rescue_excess(self, recipient: str) -> str:
-        """Governor-only. Sends the balance no liability accounts for (stray transfers,
-        donations) to `recipient`: excess = balance - (A + L + C + V). Tracked user
-        liabilities are never touched, and nothing moves while a recent payout may still
-        be in flight, because an emitted-but-unsettled payout also looks like excess."""
+    def rescue_excess(self) -> str:
+        """Governor-only, and the funds go to the governor: there is no recipient argument.
+        excess = balance - (A + L + C + V). Tracked user liabilities are never touched, and
+        nothing moves within 24 h of any payout, because an emitted-but-unsettled payout also
+        looks like excess."""
         if gl.message.sender_address != self.governor:
             raise gl.vm.UserError(f"{ERR_UNAUTHORIZED} governor only")
-        if recipient.lower() == "0x" + "0" * 40:
-            raise gl.vm.UserError(f"{ERR_INPUT} recipient cannot be the zero address")
-        dest = Address(recipient)
         if self._now() < int(self.last_payout_at) + RESCUE_GRACE_SECONDS:
             raise gl.vm.UserError(f"{ERR_IN_FLIGHT} a payout was emitted within the grace window")
         excess = int(self.balance) - self._tracked()
         if excess <= 0:
             raise gl.vm.UserError(ERR_NO_EXCESS)
-        gl.chain.Account(dest).emit_transfer(excess, on="finalized")
+        gl.chain.Account(self.governor).emit_transfer(excess, on="finalized")
         self._assert_ledger()
         return str(excess)
 

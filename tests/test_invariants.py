@@ -221,6 +221,15 @@ def test_randomised_walk_never_breaks_the_ledger(direct_vm, direct_deploy):
                 continue
             pid, who = rng.choice(live), rng.choice(funders)
             amt = rng.choice([MIN_CONTRIB, GEN]) if action == "fund" else 6 * GEN  # big pool => bond scales
+            if any(o[0] == pid for o in sh.open.values()):
+                # the pool is frozen while a challenge is pending against it
+                fund(direct_vm, who, 2000 * GEN)
+                direct_vm.sender, direct_vm.value = who, amt
+                with direct_vm.expect_revert("ERR_CHALLENGE_IN_PROGRESS"):
+                    c.fund_bounty(pid)
+                direct_vm.value = 0
+                sh.check(c)
+                continue
             fund(direct_vm, who, 2000 * GEN)
             direct_vm.sender, direct_vm.value = who, amt
             c.fund_bounty(pid)

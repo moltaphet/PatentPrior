@@ -8,6 +8,8 @@ Case 2  hardware architecture, prior art post-dates priority    -> VALID, bond s
 Case 3  dead link                                               -> AMBIGUOUS_VOID, full refund
 Case 4  active patent open for community prior-art submissions  -> stays ACTIVE
 
+Case 5  (probe) a www. citation, stored and fetched as the bare host -> was the redirect followed?
+
 Also demonstrated live: FIFO adjudication (a second challenger queued behind case 1 is
 voided and refunded when case 1 invalidates the patent) and rescue_excess (stray funds
 credited to the contract by the simulator are swept by the governor).
@@ -287,6 +289,47 @@ def main() -> int:
            active_bounty_wei=p4["active_bounty"], inventor=inv4.address, funder=funder.address,
            txs={"register_patent": reg_rec, "fund_bounty": fund_rec})
 
+    # ---- case 5: www. canonicalisation probe -------------------------------------------------
+    print("== Case 5: www. citation is stored and fetched as the bare host")
+    c5 = {
+        "case": 5, "name": "www. canonicalisation probe: does the bare host's redirect get followed?",
+        "title": "Multiplexed Streams Over UDP With Integrated TLS 1.3 Handshake",
+        "priority": "2025-01-01",
+        "claim": ("A transport protocol comprising: multiplexing independent ordered byte streams over UDP "
+                  "datagrams; integrating a TLS 1.3 handshake into the transport handshake; and supporting "
+                  "connection migration across network paths using connection identifiers."),
+        "bounty": GEN // 10,
+    }
+    inv5, chal5 = actors["inventor4"], actors["funder"]
+    reg5, cached = step(progress, "case5.register", inv5, "register_patent", [c5["title"], c5["priority"], c5["claim"]], value=c5["bounty"])
+    if not cached:
+        progress["case5.pid"] = int(inv5.view("get_patent_count"))
+    pid5 = int(progress.setdefault("case5.pid", int(inv5.view("get_patent_count"))))
+    PROGRESS.write_text(json.dumps(progress, indent=2))
+    reg5_rec = log_tx("register_patent", reg5)
+    bond5 = int(chal5.view("required_bond", [pid5]))
+    sub5, cached = step(progress, "case5.submit", chal5, "submit_prior_art",
+                        [pid5, "https://www.rfc-editor.org/rfc/rfc9000", "2021-05-27"], value=bond5)
+    if not cached:
+        progress["case5.cid"] = int(chal5.view("get_challenge_count"))
+    cid5 = int(progress.setdefault("case5.cid", int(chal5.view("get_challenge_count"))))
+    PROGRESS.write_text(json.dumps(progress, indent=2))
+    sub5_rec = log_tx("submit_prior_art (www. URL)", sub5)
+    stored5 = chal5.view("get_challenge", [cid5])["prior_art_url"]
+    ev5, _ = step(progress, "case5.evaluate", chal5, "evaluate_prior_art", [cid5], simulate=False)
+    ev5_rec = log_tx("evaluate_prior_art", ev5)
+    v5 = chal5.view("get_verdict", [cid5])
+    followed = v5["outcome"] != "AMBIGUOUS_VOID"
+    print(f"  submitted https://www.rfc-editor.org/rfc/rfc9000 -> stored {stored5}")
+    print(f"  verdict outcome={v5['outcome']} pub_date={v5['publication_date']!r} confidence={v5['confidence_score']}")
+    print(f"  redirect from the bare host {'WAS followed' if followed else 'was NOT followed (or the fetch failed): the challenge voided'}")
+    print(f"  reasoning={v5['consensus_reasoning'][:200]!r}\n")
+    if stored5 != "https://rfc-editor.org/rfc/rfc9000":
+        failures.append(f"www. was not stripped: stored {stored5}")
+    record(c5, patent_id=pid5, challenge_id=cid5, expected="not AMBIGUOUS_VOID (redirect followed)", outcome=v5["outcome"],
+           stored_url=stored5, redirect_followed=followed, verdict=v5,
+           txs={"register_patent": reg5_rec, "submit_prior_art": sub5_rec, "evaluate_prior_art": ev5_rec})
+
     # ---- rescue_excess: stray funds credited to the contract, swept by the governor --------
     print("== rescue_excess")
     rescue: dict[str, Any] = {}
@@ -299,13 +342,21 @@ def main() -> int:
     print(f"  stray funds credited: balance {int(before['contract_balance']) / GEN} -> {int(mid['contract_balance']) / GEN} GEN, "
           f"tracked {int(mid['tracked_total']) / GEN} GEN, excess {excess / GEN} GEN")
     if excess == stray:
-        rr, _ = step(progress, "rescue_excess", deployer, "rescue_excess", [deployer.address.lower()])
+        rr, _ = step(progress, "rescue_excess", deployer, "rescue_excess", [])
         rrec = log_tx("rescue_excess (governor)", rr)
+        msgs = rr["tx"].get("messages") or []
+        dest_ok = len(msgs) == 1 and msgs[0].get("recipient", "").lower() == deployer.address.lower() \
+            and int(msgs[0].get("value", 0)) == excess
+        print(f"  emitted message recipient={msgs[0].get('recipient') if msgs else None} value={msgs[0].get('value') if msgs else None} "
+              f"-> governor only: {dest_ok}")
+        if not dest_ok:
+            failures.append("rescue_excess did not emit exactly one transfer of the excess to the governor")
         end = deployer.view("get_ledger")
         untouched = all(end[k] == mid[k] for k in ("active_bounties", "locked_bonds", "claimable_credits",
                                                    "protocol_vault", "tracked_total", "total_deposited", "total_withdrawn"))
         print(f"  tracked liabilities untouched: {untouched}; balance now {int(end['contract_balance']) / GEN} GEN")
-        rescue = {"stray_wei": str(stray), "excess_wei": str(excess), "tracked_untouched": untouched,
+        rescue = {"stray_wei": str(stray), "excess_wei": str(excess), "tracked_untouched": untouched, "message_recipient_is_governor": dest_ok,
+                  "messages": msgs,
                   "balance_after_wei": end["contract_balance"], "tx": rrec}
         if not untouched:
             failures.append("rescue_excess changed tracked liabilities")
